@@ -1,8 +1,11 @@
 package dagql_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"log/slog"
 	"testing"
 
 	"github.com/99designs/gqlgen/client"
@@ -17,6 +20,13 @@ import (
 	"gotest.tools/v3/assert"
 	"gotest.tools/v3/assert/cmp"
 )
+
+var logs = new(bytes.Buffer)
+
+func init() {
+	// keep test output clean
+	slog.SetDefault(slog.New(slog.NewJSONHandler(logs, nil)))
+}
 
 type Query struct {
 }
@@ -97,6 +107,184 @@ func TestBasic(t *testing.T) {
 	// assert.Equal(t, 4, res.Point.ShiftLeft.Neighbors[3].Id)
 	assert.Equal(t, 5, res.Point.ShiftLeft.Neighbors[3].X)
 	assert.Equal(t, 8, res.Point.ShiftLeft.Neighbors[3].Y)
+}
+
+func TestNullableResults(t *testing.T) {
+	srv := dagql.NewServer(Query{})
+
+	points.Install[Query](srv)
+
+	dagql.Fields[Query]{
+		dagql.Func("nullableInt", func(ctx context.Context, self Query, args struct {
+			Value dagql.Optional[dagql.Int]
+		}) (dagql.Optional[dagql.Int], error) {
+			return args.Value, nil
+		}),
+		dagql.Func("nullablePoint", func(ctx context.Context, self Query, args struct {
+			Point dagql.Optional[dagql.ID[points.Point]]
+		}) (dagql.Nullable[points.Point], error) {
+			return dagql.MapOpt(args.Point, func(id dagql.ID[points.Point]) (points.Point, error) {
+				point, err := id.Load(ctx, srv)
+				return point.Self, err
+			})
+		}),
+		dagql.Func("nullableScalarArray", func(ctx context.Context, self Query, args struct {
+			Array dagql.Optional[dagql.ArrayInput[dagql.Int]]
+		}) (dagql.Nullable[dagql.Array[dagql.Int]], error) {
+			return dagql.MapOpt(args.Array, func(id dagql.ArrayInput[dagql.Int]) (dagql.Array[dagql.Int], error) {
+				return id.ToArray(), nil
+			})
+		}),
+		dagql.Func("nullableArrayOfPoints", func(ctx context.Context, self Query, args struct {
+			Array dagql.Optional[dagql.ArrayInput[dagql.ID[points.Point]]]
+		}) (dagql.Nullable[dagql.Array[points.Point]], error) {
+			return dagql.MapOpt(args.Array, func(id dagql.ArrayInput[dagql.ID[points.Point]]) (dagql.Array[points.Point], error) {
+				return dagql.MapArrayInput(id, func(id dagql.ID[points.Point]) (points.Point, error) {
+					point, err := id.Load(ctx, srv)
+					return point.Self, err
+				})
+			})
+		}),
+		dagql.Func("arrayOfNullableInts", func(ctx context.Context, self Query, args struct {
+			Array dagql.ArrayInput[dagql.Optional[dagql.Int]]
+		}) (dagql.Array[dagql.Optional[dagql.Int]], error) {
+			return args.Array.ToArray(), nil
+		}),
+		dagql.Func("arrayOfNullablePoints", func(ctx context.Context, self Query, args struct {
+			Array dagql.ArrayInput[dagql.Optional[dagql.ID[points.Point]]]
+		}) (dagql.Array[dagql.Nullable[points.Point]], error) {
+			return dagql.MapArrayInput(args.Array, func(id dagql.Optional[dagql.ID[points.Point]]) (dagql.Nullable[points.Point], error) {
+				return dagql.MapOpt(id, func(id dagql.ID[points.Point]) (points.Point, error) {
+					point, err := id.Load(ctx, srv)
+					return point.Self, err
+				})
+			})
+		}),
+	}.Install(srv)
+
+	gql := client.New(handler.NewDefaultServer(srv))
+
+	t.Run("nullable scalars", func(t *testing.T) {
+		var res struct {
+			Present     *int
+			NotPresent  *int
+			NullPresent *int
+		}
+		req(t, gql, `query {
+			present: nullableInt(value: 42)
+			notPresent: nullableInt
+			nullPresent: nullableInt(value: null)
+		}`, &res)
+		assert.Assert(t, res.Present != nil)
+		assert.Equal(t, 42, *res.Present)
+		assert.Assert(t, res.NotPresent == nil)
+		assert.Assert(t, res.NullPresent == nil)
+	})
+
+	t.Run("nullable objects", func(t *testing.T) {
+		var getPoint struct {
+			Point struct {
+				Id string
+			}
+		}
+		req(t, gql, `query {
+			point(x: 6, y: 7) {
+				id
+			}
+		}`, &getPoint)
+		var res struct {
+			Present    *points.Point
+			NotPresent *points.Point
+		}
+		req(t, gql, `query {
+			present: nullablePoint(point: "`+getPoint.Point.Id+`") {
+				x
+				y
+			}
+			notPresent: nullablePoint {
+				x
+				y
+			}
+		}`, &res)
+		assert.Assert(t, res.Present != nil)
+		assert.Equal(t, points.Point{X: 6, Y: 7}, *res.Present)
+		assert.Assert(t, res.NotPresent == nil)
+	})
+
+	t.Run("nullable arrays of scalars", func(t *testing.T) {
+		var res struct {
+			Present     []int
+			NotPresent  []int
+			NullPresent []int
+		}
+		req(t, gql, `query {
+			present: nullableScalarArray(array: [6, 7])
+			notPresent: nullableScalarArray
+			nullPresent: nullableScalarArray(array: null)
+		}`, &res)
+		assert.Assert(t, res.Present != nil)
+		assert.DeepEqual(t, []int{6, 7}, res.Present)
+		assert.Assert(t, res.NotPresent == nil)
+		assert.Assert(t, res.NullPresent == nil)
+	})
+
+	t.Run("non-null arrays with nullable scalars", func(t *testing.T) {
+		var res struct {
+			ArrayOfNullableInts []*int
+		}
+		req(t, gql, `query {
+			arrayOfNullableInts(array: [6, null, 7])
+		}`, &res)
+		assert.DeepEqual(t, []*int{ptr(6), nil, ptr(7)}, res.ArrayOfNullableInts)
+	})
+
+	t.Run("nullable arrays with nullable elements", func(t *testing.T) {
+		var getPoints struct {
+			Point struct {
+				Neighbors []struct {
+					Id string
+				}
+			}
+		}
+		req(t, gql, `query {
+			point(x: 6, y: 7) {
+				neighbors {
+					id
+				}
+			}
+		}`, &getPoints)
+		ids := []*string{}
+		for _, neighbor := range getPoints.Point.Neighbors {
+			id := neighbor.Id
+			ids = append(ids, &id)
+			ids = append(ids, nil)
+		}
+		payload, err := json.Marshal(ids)
+		assert.NilError(t, err)
+		var res struct {
+			ArrayOfNullablePoints []*points.Point
+		}
+		req(t, gql, `query {
+			arrayOfNullablePoints(array: `+string(payload)+`) {
+				x
+				y
+			}
+		}`, &res)
+		assert.DeepEqual(t, []*points.Point{
+			{X: 5, Y: 7},
+			nil,
+			{X: 7, Y: 7},
+			nil,
+			{X: 6, Y: 6},
+			nil,
+			{X: 6, Y: 8},
+			nil,
+		}, res.ArrayOfNullablePoints)
+	})
+}
+
+func ptr[T any](v T) *T {
+	return &v
 }
 
 func TestLoadingByID(t *testing.T) {
@@ -440,6 +628,113 @@ func TestEnums(t *testing.T) {
 	})
 }
 
+type MyInput struct {
+	Boolean dagql.Boolean `default:"true"`
+	Int     dagql.Int     `default:"42"`
+	String  dagql.String  `default:"hello, world!"`
+	Float   dagql.Float   `default:"3.14"`
+}
+
+func (MyInput) TypeName() string {
+	return "MyInput"
+}
+
+func TestInputObjects(t *testing.T) {
+	srv := dagql.NewServer(Query{})
+	gql := client.New(handler.NewDefaultServer(srv))
+
+	dagql.MustInputSpec(MyInput{}).Install(srv)
+
+	InstallDefaults(srv)
+
+	dagql.Fields[Query]{
+		dagql.Func("myInput", func(ctx context.Context, self Query, args struct {
+			Input dagql.InputObject[MyInput]
+		}) (Defaults, error) {
+			return Defaults(args.Input.Value), nil
+		}),
+	}.Install(srv)
+
+	type values struct {
+		Boolean bool
+		Int     int
+		String  string
+		Float   float64
+	}
+
+	t.Run("inputs and defaults", func(t *testing.T) {
+		var res struct {
+			NotDefaults values
+			Defaults    values
+		}
+		req(t, gql, `query {
+			defaults: myInput(input: {}) {
+				boolean
+				int
+				string
+				float
+			}
+			notDefaults: myInput(input: {boolean: false, int: 21, string: "goodbye, world!", float: 6.28}) {
+				boolean
+				int
+				string
+				float
+			}
+		}`, &res)
+
+		assert.Equal(t, values{true, 42, "hello, world!", 3.14}, res.Defaults)
+		assert.Equal(t, values{false, 21, "goodbye, world!", 6.28}, res.NotDefaults)
+	})
+
+	t.Run("nullable inputs", func(t *testing.T) {
+		dagql.Fields[Query]{
+			dagql.Func("myOptionalInput", func(ctx context.Context, self Query, args struct {
+				Input dagql.Optional[dagql.InputObject[MyInput]]
+			}) (dagql.Nullable[dagql.Boolean], error) {
+				return dagql.MapOpt(args.Input, func(input dagql.InputObject[MyInput]) (dagql.Boolean, error) {
+					return input.Value.Boolean, nil
+				})
+			}),
+		}.Install(srv)
+
+		var res struct {
+			ProvidedFalse *bool
+			ProvidedTrue  *bool
+			NotProvided   *bool
+		}
+		req(t, gql, `query {
+			providedFalse: myOptionalInput(input: {boolean: false})
+			providedTrue: myOptionalInput(input: {boolean: true})
+			notProvided: myOptionalInput
+		}`, &res)
+
+		assert.DeepEqual(t, ptr(false), res.ProvidedFalse)
+		assert.DeepEqual(t, ptr(true), res.ProvidedTrue)
+		assert.DeepEqual(t, (*bool)(nil), res.NotProvided)
+	})
+
+	t.Run("arrays of inputs", func(t *testing.T) {
+		dagql.Fields[Query]{
+			dagql.Func("myArrayInput", func(ctx context.Context, self Query, args struct {
+				Input dagql.ArrayInput[dagql.InputObject[MyInput]]
+			}) (dagql.Array[dagql.Boolean], error) {
+				return dagql.MapArrayInput(args.Input, func(input dagql.InputObject[MyInput]) (dagql.Boolean, error) {
+					return input.Value.Boolean, nil
+				})
+			}),
+		}.Install(srv)
+
+		var res struct {
+			MyArrayInput []bool
+		}
+		req(t, gql, `query {
+			myArrayInput(input: [{boolean: false}, {boolean: true}, {}])
+		}`, &res)
+
+		assert.DeepEqual(t, []bool{false, true, true}, res.MyArrayInput)
+	})
+}
+
 type Defaults struct {
 	Boolean dagql.Boolean `default:"true"`
 	Int     dagql.Int     `default:"42"`
@@ -454,10 +749,7 @@ func (Defaults) Type() *ast.Type {
 	}
 }
 
-func TestDefaults(t *testing.T) {
-	srv := dagql.NewServer(Query{})
-	gql := client.New(handler.NewDefaultServer(srv))
-
+func InstallDefaults(srv *dagql.Server) {
 	dagql.Fields[Defaults]{
 		dagql.Func("boolean", func(ctx context.Context, self Defaults, _ any) (dagql.Boolean, error) {
 			return self.Boolean, nil
@@ -472,6 +764,13 @@ func TestDefaults(t *testing.T) {
 			return self.Float, nil
 		}),
 	}.Install(srv)
+}
+
+func TestDefaults(t *testing.T) {
+	srv := dagql.NewServer(Query{})
+	gql := client.New(handler.NewDefaultServer(srv))
+
+	InstallDefaults(srv)
 
 	t.Run("builtin scalar types", func(t *testing.T) {
 		dagql.Fields[Query]{

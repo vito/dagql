@@ -7,6 +7,7 @@ import (
 	"github.com/99designs/gqlgen/graphql/introspection"
 	"github.com/vektah/gqlparser/v2/ast"
 	"github.com/vito/dagql"
+	"github.com/vito/dagql/idproto"
 )
 
 func Install[T dagql.Typed](srv *dagql.Server) {
@@ -33,17 +34,17 @@ func Install[T dagql.Typed](srv *dagql.Server) {
 		dagql.Func("queryType", func(ctx context.Context, self Schema, args struct{}) (Type, error) {
 			return NewType(*self.QueryType()), nil
 		}),
-		dagql.Func("mutationType", func(ctx context.Context, self Schema, args struct{}) (dagql.Optional[Type], error) {
+		dagql.Func("mutationType", func(ctx context.Context, self Schema, args struct{}) (dagql.Nullable[Type], error) {
 			if self.MutationType() == nil {
-				return dagql.Optional[Type]{}, nil
+				return dagql.Null[Type](), nil
 			}
-			return dagql.Opt(NewType(*self.MutationType())), nil
+			return dagql.NonNull(NewType(*self.MutationType())), nil
 		}),
-		dagql.Func("subscriptionType", func(ctx context.Context, self Schema, args struct{}) (dagql.Optional[Type], error) {
+		dagql.Func("subscriptionType", func(ctx context.Context, self Schema, args struct{}) (dagql.Nullable[Type], error) {
 			if self.SubscriptionType() == nil {
-				return dagql.Optional[Type]{}, nil
+				return dagql.Null[Type](), nil
 			}
-			return dagql.Opt(NewType(*self.SubscriptionType())), nil
+			return dagql.NonNull(NewType(*self.SubscriptionType())), nil
 		}),
 		dagql.Func("types", func(ctx context.Context, self Schema, args struct{}) (dagql.Array[Type], error) {
 			var types []Type
@@ -118,11 +119,11 @@ func Install[T dagql.Typed](srv *dagql.Server) {
 			}
 			return values, nil
 		}),
-		dagql.Func("ofType", func(ctx context.Context, self Type, args struct{}) (dagql.Optional[Type], error) {
+		dagql.Func("ofType", func(ctx context.Context, self Type, args struct{}) (dagql.Nullable[Type], error) {
 			if self.OfType() == nil {
-				return dagql.Optional[Type]{}, nil
+				return dagql.Null[Type](), nil
 			}
-			return dagql.Opt(NewType(*self.OfType())), nil
+			return dagql.NonNull(NewType(*self.OfType())), nil
 		}),
 	}.Install(srv)
 
@@ -354,11 +355,9 @@ func (s EnumValue) Type() *ast.Type {
 	}
 }
 
-type TypeKind struct {
-	dagql.Scalar
-}
+type TypeKind string
 
-var TypeKinds = dagql.EnumValues[TypeKind]{
+var TypeKinds = dagql.NewEnum[TypeKind](
 	"SCALAR",
 	"OBJECT",
 	"INTERFACE",
@@ -367,14 +366,17 @@ var TypeKinds = dagql.EnumValues[TypeKind]{
 	"INPUT_OBJECT",
 	"LIST",
 	"NON_NULL",
+)
+
+func (k TypeKind) Decoder() dagql.InputDecoder {
+	return TypeKinds
 }
 
-func (k TypeKind) New(val dagql.Scalar) TypeKind {
-	k.Scalar = val
-	return k
+func (k TypeKind) ToLiteral() *idproto.Literal {
+	return TypeKinds.Literal(k)
 }
 
-var _ dagql.Typed = TypeKind{}
+var _ dagql.Typed = TypeKind("")
 
 func (k TypeKind) Type() *ast.Type {
 	return &ast.Type{
@@ -383,11 +385,9 @@ func (k TypeKind) Type() *ast.Type {
 	}
 }
 
-type DirectiveLocation struct {
-	dagql.Scalar
-}
+type DirectiveLocation string
 
-var DirectiveLocations = dagql.EnumValues[DirectiveLocation]{
+var DirectiveLocations = dagql.NewEnum[DirectiveLocation](
 	"QUERY",
 	"MUTATION",
 	"SUBSCRIPTION",
@@ -407,14 +407,17 @@ var DirectiveLocations = dagql.EnumValues[DirectiveLocation]{
 	"ENUM_VALUE",
 	"INPUT_OBJECT",
 	"INPUT_FIELD_DEFINITION",
+)
+
+func (k DirectiveLocation) Decoder() dagql.InputDecoder {
+	return DirectiveLocations
 }
 
-func (k DirectiveLocation) New(val dagql.Scalar) DirectiveLocation {
-	k.Scalar = val
-	return k
+func (k DirectiveLocation) ToLiteral() *idproto.Literal {
+	return DirectiveLocations.Literal(k)
 }
 
-var _ dagql.Typed = DirectiveLocation{}
+var _ dagql.Typed = DirectiveLocation("")
 
 func (k DirectiveLocation) Type() *ast.Type {
 	return &ast.Type{

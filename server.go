@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"sort"
 	"sync"
 
 	"github.com/99designs/gqlgen/graphql"
+	"github.com/iancoleman/strcase"
 	"github.com/opencontainers/go-digest"
 	"github.com/sourcegraph/conc/pool"
 	"github.com/vektah/gqlparser/v2/ast"
@@ -23,6 +25,7 @@ type Server struct {
 	rec         *progrock.Recorder
 	classes     map[string]ObjectType
 	scalars     map[string]ScalarType
+	inputs      map[string]*ast.Definition
 	cache       *CacheMap[digest.Digest, Typed]
 	installLock sync.Mutex
 }
@@ -47,7 +50,8 @@ func NewServer[T Typed](root T) *Server {
 			// instead of a single ID type, each object has its own ID type
 			// "ID": ID{},
 		},
-		cache: NewCacheMap[digest.Digest, Typed](),
+		inputs: map[string]*ast.Definition{},
+		cache:  NewCacheMap[digest.Digest, Typed](),
 	}
 	return srv
 }
@@ -65,19 +69,22 @@ func (s *Server) Root() Object {
 var _ graphql.ExecutableSchema = (*Server)(nil)
 
 // Schema returns the current schema of the server.
-func (s *Server) Schema() *ast.Schema {
+func (s *Server) Schema() *ast.Schema { // TODO: change this to be updated whenever something is installed, instead
 	// TODO track when the schema changes, cache until it changes again
 	queryType := s.Root().Type().Name()
 	schema := &ast.Schema{}
-	for _, t := range s.classes {
-		def := t.Definition()
+	for _, t := range s.classes { // TODO stable order
+		def := definition(ast.Object, t)
 		if def.Name == queryType {
 			schema.Query = def
 		}
 		schema.AddTypes(def)
 	}
 	for _, t := range s.scalars {
-		schema.AddTypes(t.Definition())
+		schema.AddTypes(definition(ast.Scalar, t))
+	}
+	for _, t := range s.inputs {
+		schema.AddTypes(t)
 	}
 	return schema
 }
@@ -107,7 +114,7 @@ func (s *Server) Exec(ctx1 context.Context) graphql.ResponseHandler {
 				if gqlOp.OperationName != "" && gqlOp.OperationName != op.Name {
 					continue
 				}
-				sels, err := s.parseASTSelections(gqlOp, op.SelectionSet)
+				sels, err := s.parseASTSelections(gqlOp, s.root.Type(), op.SelectionSet)
 				if err != nil {
 					return graphql.ErrorResponse(ctx, "failed to convert selections: %s", err)
 				}
@@ -224,11 +231,11 @@ func (s *Server) Load(ctx context.Context, id *idproto.ID) (Object, error) {
 func (s *Server) resolvePath(ctx context.Context, self Object, sel Selection) (res any, rerr error) {
 	class, ok := s.classes[self.Type().Name()]
 	if !ok {
-		return nil, fmt.Errorf("unknown type: %q", self.Type().Name())
+		return nil, fmt.Errorf("resolvePath: unknown type: %q", self.Type().Name())
 	}
 	fieldDef, ok := class.FieldDefinition(sel.Selector.Field)
 	if fieldDef == nil {
-		return nil, fmt.Errorf("unknown field: %q", sel.Selector.Field)
+		return nil, fmt.Errorf("resolvePath: unknown field: %q", sel.Selector.Field)
 	}
 
 	chainedID := sel.Selector.appendToID(self.ID(), fieldDef)
@@ -291,6 +298,13 @@ func (s *Server) resolvePath(ctx context.Context, self Object, sel Selection) (r
 				if err != nil {
 					return nil, err
 				}
+				if wrapped, ok := val.(NullableWrapper); ok { // TODO unfortunate that we need this here too
+					val, ok = wrapped.Unwrap()
+					if !ok {
+						results = append(results, nil)
+						continue
+					}
+				}
 				node, err := s.toSelectable(chainedID.Nth(nth), val)
 				if err != nil {
 					return nil, fmt.Errorf("instantiate %dth array element: %w", nth, err)
@@ -334,7 +348,7 @@ func (s *Server) constructorToSelection(ctx context.Context, selfType *ast.Type,
 		if err != nil {
 			return Selection{}, err
 		}
-		sel.Selector.Args = append(sel.Selector.Args, Arg{
+		sel.Selector.Args = append(sel.Selector.Args, NamedInput{
 			Name:  arg.Name,
 			Value: val,
 		})
@@ -354,16 +368,16 @@ func (s *Server) constructorToSelection(ctx context.Context, selfType *ast.Type,
 func (s *Server) field(typeName, fieldName string) (*ast.FieldDefinition, error) {
 	classes, ok := s.classes[typeName]
 	if !ok {
-		return nil, fmt.Errorf("unknown type: %q", typeName)
+		return nil, fmt.Errorf("field(%q, %q): unknown type", typeName, fieldName)
 	}
 	fieldDef, ok := classes.FieldDefinition(fieldName)
 	if !ok {
-		return nil, fmt.Errorf("unknown field: %q", fieldName)
+		return nil, fmt.Errorf("field(%q, %q): unknown field", typeName, fieldName)
 	}
 	return fieldDef, nil
 }
 
-func (s *Server) fromLiteral(ctx context.Context, lit *idproto.Literal, argDef *ast.ArgumentDefinition) (Typed, error) {
+func (s *Server) fromLiteral(ctx context.Context, lit *idproto.Literal, argDef *ast.ArgumentDefinition) (Input, error) {
 	switch v := lit.Value.(type) {
 	case *idproto.Literal_Id:
 		if v.Id.Type.NamedType == "" {
@@ -384,7 +398,7 @@ func (s *Server) fromLiteral(ctx context.Context, lit *idproto.Literal, argDef *
 	case *idproto.Literal_Bool:
 		return NewBoolean(v.Bool), nil
 	case *idproto.Literal_List:
-		list := make(Array[Typed], len(v.List.Values))
+		list := make(ArrayInput[Input], len(v.List.Values))
 		for i, val := range v.List.Values {
 			typed, err := s.fromLiteral(ctx, val, argDef)
 			if err != nil {
@@ -401,7 +415,7 @@ func (s *Server) fromLiteral(ctx context.Context, lit *idproto.Literal, argDef *
 		if !ok {
 			return nil, fmt.Errorf("unknown scalar: %q", typeName)
 		}
-		return scalar.New(v.Enum)
+		return scalar.DecodeInput(v.Enum)
 	default:
 		panic(fmt.Sprintf("fromLiteral: unsupported literal type %T", v))
 	}
@@ -420,46 +434,37 @@ func (s *Server) toSelectable(chainedID *idproto.ID, val Typed) (Object, error) 
 	return class.New(chainedID, val)
 }
 
-func (s *Server) parseASTSelections(gqlOp *graphql.OperationContext, astSels ast.SelectionSet) ([]Selection, error) {
+func (s *Server) parseASTSelections(gqlOp *graphql.OperationContext, self *ast.Type, astSels ast.SelectionSet) ([]Selection, error) {
 	vars := gqlOp.Variables
+
+	class := s.classes[self.Name()]
+	if class == nil {
+		return nil, fmt.Errorf("parseASTSelections: not an Object type: %q", self.Name())
+	}
 
 	sels := []Selection{}
 	for _, sel := range astSels {
 		switch x := sel.(type) {
 		case *ast.Field:
-			args := make([]Arg, len(x.Arguments))
-			for i, arg := range x.Arguments {
-				val, err := arg.Value.Value(vars)
-				if err != nil {
-					return nil, err
-				}
-				arg := x.Definition.Arguments.ForName(arg.Name)
-				if arg == nil {
-					return nil, fmt.Errorf("unknown argument: %q", arg.Name)
-				}
-				scalar, ok := s.scalars[arg.Type.Name()]
-				if !ok {
-					return nil, fmt.Errorf("unknown scalar: %q", arg.Type.Name())
-				}
-				typed, err := scalar.New(val)
-				if err != nil {
-					return nil, err
-				}
-				args[i] = Arg{
-					Name:  arg.Name,
-					Value: typed,
-				}
+			if x.Definition == nil {
+				// surprisingly, this is a thing that can happen, even though most
+				// validations should have happened by now.
+				return nil, fmt.Errorf("parseASTSelections: unknown field: %q", x.Name)
 			}
-			subsels, err := s.parseASTSelections(gqlOp, x.SelectionSet)
+			sel, err := class.ParseField(x, vars)
 			if err != nil {
 				return nil, err
 			}
+			var subsels []Selection
+			if len(x.SelectionSet) > 0 {
+				subsels, err = s.parseASTSelections(gqlOp, x.Definition.Type, x.SelectionSet)
+				if err != nil {
+					return nil, err
+				}
+			}
 			sels = append(sels, Selection{
-				Alias: x.Alias,
-				Selector: Selector{
-					Field: x.Name,
-					Args:  args,
-				},
+				Alias:         x.Alias,
+				Selector:      sel,
 				Subselections: subsels,
 			})
 		case *ast.FragmentSpread:
@@ -467,11 +472,13 @@ func (s *Server) parseASTSelections(gqlOp *graphql.OperationContext, astSels ast
 			if fragment == nil {
 				return nil, fmt.Errorf("unknown fragment: %s", x.Name)
 			}
-			subsels, err := s.parseASTSelections(gqlOp, fragment.SelectionSet)
-			if err != nil {
-				return nil, err
+			if len(fragment.SelectionSet) > 0 {
+				subsels, err := s.parseASTSelections(gqlOp, self, fragment.SelectionSet)
+				if err != nil {
+					return nil, err
+				}
+				sels = append(sels, subsels...)
 			}
-			sels = append(sels, subsels...)
 		default:
 			return nil, fmt.Errorf("unknown field type: %T", x)
 		}
@@ -499,7 +506,7 @@ func (sel Selection) Name() string {
 // Selector specifies how to retrieve a value from an Instance.
 type Selector struct {
 	Field string
-	Args  []Arg
+	Args  []NamedInput
 	Nth   int
 }
 
@@ -521,9 +528,9 @@ func (sel Selector) String() string {
 	return str
 }
 
-type Args []Arg
+type Inputs []NamedInput
 
-func (args Args) Lookup(name string) (Typed, bool) {
+func (args Inputs) Lookup(name string) (Typed, bool) {
 	for _, arg := range args {
 		if arg.Name == name {
 			return arg.Value, true
@@ -532,23 +539,26 @@ func (args Args) Lookup(name string) (Typed, bool) {
 	return nil, false
 }
 
-type Arg struct {
+type NamedInput struct {
 	Name  string
-	Value Typed
+	Value Input
 }
 
-func (arg Arg) String() string {
-	ast := ToLiteral(arg.Value).ToAST()
-	return fmt.Sprintf("%s: %v", arg.Name, ast.Raw)
+func (arg NamedInput) String() string {
+	return fmt.Sprintf("%s: %v", arg.Name, arg.Value.ToLiteral().ToAST())
 }
 
 func (sel Selector) appendToID(id *idproto.ID, field *ast.FieldDefinition) *idproto.ID {
 	cp := id.Clone()
 	idArgs := make([]*idproto.Argument, 0, len(sel.Args))
 	for _, arg := range sel.Args {
+		if arg.Value == nil {
+			// we don't include null arguments, since they would needlessly bust caches
+			continue
+		}
 		idArgs = append(idArgs, &idproto.Argument{
 			Name:  arg.Name,
-			Value: ToLiteral(arg.Value),
+			Value: arg.Value.ToLiteral(),
 		})
 	}
 	sort.Slice(idArgs, func(i, j int) bool {
@@ -562,4 +572,107 @@ func (sel Selector) appendToID(id *idproto.ID, field *ast.FieldDefinition) *idpr
 	})
 	cp.Type = idproto.NewType(field.Type)
 	return cp
+}
+
+type DecoderFunc func(any) (Input, error)
+
+var _ InputDecoder = DecoderFunc(nil)
+
+func (f DecoderFunc) DecodeInput(val any) (Input, error) {
+	return f(val)
+}
+
+type InputObject[T Type] struct {
+	Value T
+}
+
+var _ Input = InputObject[Type]{} // TODO
+
+func (InputObject[T]) Type() *ast.Type {
+	var zero T
+	return &ast.Type{
+		NamedType: zero.TypeName(),
+		NonNull:   true,
+	}
+}
+
+func (InputObject[T]) Decoder() InputDecoder {
+	return DecoderFunc(func(val any) (Input, error) {
+		vals, ok := val.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("expected map[string]any, got %T", val)
+		}
+		var obj T
+		objT := reflect.TypeOf(obj)
+		objV := reflect.ValueOf(&obj)
+		if objT.Kind() != reflect.Struct {
+			// TODO handle pointer?
+			return nil, fmt.Errorf("object must be a struct, got %T", obj)
+		}
+		for i := 0; i < objT.NumField(); i++ {
+			fieldT := objT.Field(i)
+			fieldV := objV.Elem().Field(i)
+			name := fieldT.Tag.Get("name")
+			if name == "" {
+				name = strcase.ToLowerCamel(fieldT.Name)
+			}
+			zeroInput, ok := fieldV.Interface().(Input)
+			if !ok {
+				return nil, fmt.Errorf("field %q (%T) cannot be passed as an input", fieldT.Name, val)
+			}
+			var input Input
+			if val, ok := vals[name]; ok {
+				var err error
+				input, err = zeroInput.Decoder().DecodeInput(val)
+				if err != nil {
+					return nil, err
+				}
+			} else {
+				if inputDefStr := fieldT.Tag.Get("default"); len(inputDefStr) > 0 {
+					var err error
+					input, err = zeroInput.Decoder().DecodeInput(inputDefStr)
+					if err != nil {
+						return nil, fmt.Errorf("convert default value for arg %s: %w", name, err)
+					}
+				}
+				// TODO is required-ness checked by now at schema validation?
+			}
+			fieldV.Set(reflect.ValueOf(input))
+		}
+		return InputObject[T]{
+			Value: obj,
+		}, nil
+	})
+}
+
+func (InputObject[T]) ToLiteral() *idproto.Literal {
+	var obj T
+	objT := reflect.TypeOf(obj)
+	objV := reflect.ValueOf(obj)
+	if objV.Kind() != reflect.Struct {
+		// TODO handle pointer?
+		panic(fmt.Errorf("object must be a struct, got %T", obj))
+	}
+	lit := &idproto.Object{}
+	for i := 0; i < objV.NumField(); i++ {
+		fieldT := objT.Field(i)
+		name := fieldT.Tag.Get("name")
+		if name == "" {
+			name = strcase.ToLowerCamel(fieldT.Name)
+		}
+		val := objV.Field(i).Interface()
+		input, ok := val.(Input)
+		if !ok {
+			panic(fmt.Errorf("arg %q (%T) cannot be passed as an input", fieldT.Name, val))
+		}
+		lit.Values = append(lit.Values, &idproto.Argument{
+			Name:  name,
+			Value: input.ToLiteral(),
+		})
+	}
+	return &idproto.Literal{
+		Value: &idproto.Literal_Object{
+			Object: lit,
+		},
+	}
 }
