@@ -36,7 +36,16 @@ type ObjectType interface {
 	// ParseField parses the given field and returns a Selector and an expected
 	// return type.
 	ParseField(context.Context, *ast.Field, map[string]any) (Selector, *ast.Type, error)
+	// Extend registers an additional field onto the type.
+	//
+	// Unlike natively added fields, the extended func is limited to the external
+	// Object interface.
+	Extend(FieldSpec, FieldFunc)
 }
+
+// FieldFunc is a function that implements a field on an object while limited
+// to the object's external interface.
+type FieldFunc func(context.Context, Object, map[string]Typed) (Typed, error)
 
 // Object represents an Object in the graph which has an ID and can have
 // sub-selections.
@@ -847,7 +856,11 @@ type InputObjectSpec struct {
 }
 
 func (spec InputObjectSpec) Install(srv *Server) {
-	srv.inputs[spec.Name] = spec.Definition()
+	srv.InstallTypeDef(spec)
+}
+
+func (spec InputObjectSpec) TypeName() string {
+	return spec.Name
 }
 
 func (spec InputObjectSpec) Definition() *ast.Definition {

@@ -79,6 +79,20 @@ func (id *ID) Append(ret *ast.Type, field string, args ...*Argument) *ID {
 	}
 }
 
+func (id *ID) Rebase(root *ID) *ID {
+	cp := id.Clone()
+	rebase(cp, root)
+	return cp
+}
+
+func rebase(id *ID, root *ID) {
+	if id.Parent == nil {
+		id.Parent = root
+	} else {
+		rebase(id.Parent, root)
+	}
+}
+
 func (id *ID) WithTainted(tainted bool) *ID {
 	cp := id.Clone()
 	cp.Tainted = tainted

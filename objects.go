@@ -56,6 +56,17 @@ func (cls Class[T]) TypeName() string {
 	return zero.Type().Name()
 }
 
+func (cls Class[T]) Extend(spec FieldSpec, fun FieldFunc) {
+	cls.fieldsL.Lock()
+	defer cls.fieldsL.Unlock()
+	cls.fields[spec.Name] = &Field[T]{
+		Spec: spec,
+		Func: func(ctx context.Context, self Instance[T], args map[string]Typed) (Typed, error) {
+			return fun(ctx, self, args)
+		},
+	}
+}
+
 // Definition returns the schema definition of the class.
 //
 // The definition is derived from the type name, description, and fields. The
@@ -89,7 +100,7 @@ func (cls Class[T]) Definition() *ast.Definition {
 func (cls Class[T]) ParseField(ctx context.Context, astField *ast.Field, vars map[string]any) (Selector, *ast.Type, error) {
 	field, ok := cls.Field(astField.Name)
 	if !ok {
-		return Selector{}, nil, fmt.Errorf("%s has no such field: %q", cls.Definition().Name, astField.Name)
+		return Selector{}, nil, fmt.Errorf("ParseField: %s has no such field: %q", cls.Definition().Name, astField.Name)
 	}
 	args := make([]NamedInput, len(astField.Arguments))
 	for i, arg := range astField.Arguments {
@@ -138,7 +149,7 @@ func (cls Class[T]) Call(ctx context.Context, node Instance[T], fieldName string
 	field, ok := cls.Field(fieldName)
 	if !ok {
 		var zero T
-		return nil, fmt.Errorf("%s has no such field: %q", zero.Type().Name(), fieldName)
+		return nil, fmt.Errorf("Call: %s has no such field: %q", zero.Type().Name(), fieldName)
 	}
 	return field.Func(ctx, node, args)
 }
@@ -177,7 +188,7 @@ func (r Instance[T]) IDFor(ctx context.Context, sel Selector) (*idproto.ID, erro
 	field, ok := r.Class.Field(sel.Field)
 	if !ok {
 		var zero T
-		return nil, fmt.Errorf("%s has no such field: %q", zero.Type().Name(), sel.Field)
+		return nil, fmt.Errorf("IDFor: %s has no such field: %q", zero.Type().Name(), sel.Field)
 	}
 	return sel.AppendTo(r.ID(), field.Spec.Type.Type(), !field.Spec.Pure), nil
 }
@@ -187,7 +198,7 @@ func (r Instance[T]) Select(ctx context.Context, sel Selector) (val Typed, err e
 	field, ok := r.Class.Field(sel.Field)
 	if !ok {
 		var zero T
-		return nil, fmt.Errorf("%s has no such field: %q", zero.Type().Name(), sel.Field)
+		return nil, fmt.Errorf("Select: %s has no such field: %q", zero.Type().Name(), sel.Field)
 	}
 	args, err := applyDefaults(field.Spec, sel.Args)
 	if err != nil {
@@ -412,10 +423,10 @@ func (fields Fields[T]) Install(server *Server) {
 
 func (fields Fields[T]) findOrInitializeType(server *Server, typeName string) Class[T] {
 	var classT Class[T]
-	class, ok := server.classes[typeName]
+	class, ok := server.objects[typeName]
 	if !ok {
 		classT = NewClass[T]()
-		server.classes[typeName] = classT
+		server.objects[typeName] = classT
 
 		// TODO: better way to avoid registering IDs for schema introspection
 		// builtins
