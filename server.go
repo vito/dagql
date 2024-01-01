@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"reflect"
 	"sort"
 	"sync"
@@ -19,6 +20,8 @@ import (
 
 type TelemetryFunc func(context.Context, *idproto.ID) (context.Context, func(error))
 
+type Cache = *CacheMap[digest.Digest, Typed]
+
 // Server represents a GraphQL server whose schema is dynamically modified at
 // runtime.
 type Server struct {
@@ -27,8 +30,13 @@ type Server struct {
 	objects     map[string]ObjectType
 	scalars     map[string]ScalarType
 	typeDefs    map[string]TypeDef
-	cache       *CacheMap[digest.Digest, Typed]
-	installLock sync.Mutex
+	installLock *sync.Mutex
+
+	// Cache is the inner cache used by the server. It can be replicated to
+	// another *Server to inherit and share caches.
+	//
+	// TODO: copy-on-write
+	Cache Cache
 }
 
 // TypeDef is a type whose sole practical purpose is to define a GraphQL type,
@@ -55,10 +63,12 @@ func NewServer[T Typed](root T) *Server {
 			Self:  root,
 			Class: rootClass,
 		},
-		objects:  map[string]ObjectType{},
-		scalars:  map[string]ScalarType{},
-		typeDefs: map[string]TypeDef{},
-		cache:    NewCacheMap[digest.Digest, Typed](),
+		objects:     map[string]ObjectType{},
+		scalars:     map[string]ScalarType{},
+		typeDefs:    map[string]TypeDef{},
+		installLock: &sync.Mutex{},
+
+		Cache: NewCacheMap[digest.Digest, Typed](),
 	}
 	srv.InstallObject(rootClass)
 	for _, scalar := range coreScalars {
@@ -229,7 +239,7 @@ func (s *Server) ExecOp(ctx context.Context, gqlOp *graphql.OperationContext) (m
 			}
 			sels, err := s.parseASTSelections(ctx, gqlOp, s.root.Type(), op.SelectionSet)
 			if err != nil {
-				return nil, fmt.Errorf("parse selections: %w", err)
+				return nil, fmt.Errorf("query:\n%s\n\nerror: parse selections: %w", gqlOp.RawQuery, err)
 			}
 			results, err = s.Resolve(ctx, s.root, sels...)
 			if err != nil {
@@ -320,6 +330,20 @@ func (s *Server) Load(ctx context.Context, id *idproto.ID) (Object, error) {
 	return s.toSelectable(id, res)
 }
 
+func (s *Server) Select(ctx context.Context, self Object, dest any, sels ...Selector) error {
+	for _, sel := range sels {
+		res, id, err := s.cachedSelect(ctx, self, sel)
+		if err != nil {
+			return err
+		}
+		self, err = s.toSelectable(id, res)
+		if err != nil {
+			return err
+		}
+	}
+	return assign(reflect.ValueOf(dest).Elem(), self)
+}
+
 func LoadIDs[T Typed](ctx context.Context, srv *Server, ids []ID[T]) ([]T, error) {
 	var out []T
 	for _, id := range ids {
@@ -360,15 +384,19 @@ func (s *Server) cachedSelect(ctx context.Context, self Object, sel Selector) (r
 	if s.telemetry != nil {
 		var done func(error)
 		wrapped, done := s.telemetry(ctx, chainedID)
-		defer done(rerr)
+		defer func() {
+			done(rerr)
+		}()
 		ctx = wrapped
 	}
 	var val Typed
 	if chainedID.IsTainted() {
 		val, err = self.Select(ctx, sel)
 	} else {
-		val, err = s.cache.GetOrInitialize(ctx, dig, func(ctx context.Context) (Typed, error) {
+		val, err = s.Cache.GetOrInitializeOnHit(ctx, dig, func(ctx context.Context) (Typed, error) {
 			return self.Select(ctx, sel)
+		}, func(val Typed, err error) {
+			log.Println("!!!!!! CACHE HIT:", chainedID.Display(), fmt.Sprintf("%T", val), err)
 		})
 	}
 	if err != nil {
@@ -389,8 +417,12 @@ func (s *Server) resolvePath(ctx context.Context, self Object, sel Selection) (r
 	}
 
 	if len(sel.Subselections) == 0 {
-		// there are no sub-selections; we're done
 		return val, nil
+		// if lit, ok := val.(idproto.Literate); ok {
+		// 	// there are no sub-selections; we're done
+		// 	return lit.ToLiteral().ToInput(), nil
+		// }
+		// return nil, fmt.Errorf("%s must have sub-selections", val.Type())
 	}
 
 	enum, ok := val.(Enumerable)
@@ -461,7 +493,7 @@ func (s *Server) parseASTSelections(ctx context.Context, gqlOp *graphql.Operatio
 		case *ast.Field:
 			sel, resType, err := class.ParseField(ctx, x, vars)
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("parse field %q: %w", x.Name, err)
 			}
 			var subsels []Selection
 			if len(x.SelectionSet) > 0 {

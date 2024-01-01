@@ -58,6 +58,10 @@ func (m *Module) Type() *ast.Type {
 	return m.srv.Root().Type()
 }
 
+func (m *Module) ObjectType() ObjectType {
+	return m.srv.Root().ObjectType()
+}
+
 func (m *Module) ID() *idproto.ID {
 	return m.id
 }
@@ -71,5 +75,5 @@ func (m *Module) IDFor(ctx context.Context, sel Selector) (*idproto.ID, error) {
 }
 
 func (m *Module) Select(ctx context.Context, sel Selector) (val Typed, err error) {
-	return m.srv.root.Select(ctx, sel)
+	return m.srv.Root().Select(ctx, sel)
 }

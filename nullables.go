@@ -3,6 +3,7 @@ package dagql
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"reflect"
 
 	"github.com/vektah/gqlparser/v2/ast"
@@ -197,6 +198,18 @@ func (n DynamicOptional) SetField(val reflect.Value) error {
 		}
 	}
 	return nil
+}
+
+func (i DynamicOptional) MarshalJSON() ([]byte, error) {
+	if !i.Valid {
+		return json.Marshal(nil)
+	}
+	optional, err := json.Marshal(i.Value)
+	if err != nil {
+		return nil, err
+	}
+	log.Println("!!! DYNAMICOPTIONAL MARSHALJSON", string(optional))
+	return optional, nil
 }
 
 // Nullable wraps a type and allows it to be null.

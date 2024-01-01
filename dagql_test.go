@@ -33,6 +33,7 @@ func init() {
 }
 
 type Query struct {
+	dagql.Objectable
 }
 
 func (Query) Type() *ast.Type {
