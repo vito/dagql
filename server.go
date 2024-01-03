@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"reflect"
 	"sort"
 	"sync"
@@ -44,6 +45,12 @@ type Cache interface {
 		context.Context,
 		digest.Digest,
 		func(context.Context) (Typed, error),
+	) (Typed, error)
+	GetOrInitializeOnHit(
+		context.Context,
+		digest.Digest,
+		func(context.Context) (Typed, error),
+		func(Typed, error),
 	) (Typed, error)
 }
 
@@ -418,8 +425,10 @@ func (s *Server) cachedSelect(ctx context.Context, self Object, sel Selector) (r
 	if chainedID.IsTainted() {
 		val, err = self.Select(ctx, sel)
 	} else {
-		val, err = s.Cache.GetOrInitialize(ctx, dig, func(ctx context.Context) (Typed, error) {
+		val, err = s.Cache.GetOrInitializeOnHit(ctx, dig, func(ctx context.Context) (Typed, error) {
 			return self.Select(ctx, sel)
+		}, func(val Typed, err error) {
+			log.Println("!!! CACHE HIT", dig, val.Type(), chainedID.Display(), err)
 		})
 	}
 	if err != nil {

@@ -182,6 +182,11 @@ func (r Instance[T]) ID() *idproto.ID {
 	return r.Constructor
 }
 
+// Inner returns the inner value of the instance.
+func (r Instance[T]) Inner() Typed {
+	return r.Self
+}
+
 // String returns the instance in Class@sha256:... format.
 func (r Instance[T]) String() string {
 	dig, err := r.Constructor.Digest()

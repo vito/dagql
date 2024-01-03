@@ -36,7 +36,11 @@ func (id *ID) DisplaySelf() string {
 		if id, ok := arg.Value.Value.(*Literal_Id); ok {
 			fmt.Fprintf(buf, "%s: {%s}", arg.Name, id.Id.Display())
 		} else {
-			fmt.Fprintf(buf, "%s: %s", arg.Name, arg.Value.ToAST())
+			val := arg.Value.ToAST().String()
+			if len(val) > 100 {
+				val = val[:100] + "..."
+			}
+			fmt.Fprintf(buf, "%s: %s", arg.Name, val)
 		}
 		if ai == len(id.Args)-1 {
 			fmt.Fprintf(buf, ")")
